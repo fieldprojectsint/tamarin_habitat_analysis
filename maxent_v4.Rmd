@@ -1,0 +1,711 @@
+---
+title: "BehaviorPoints"
+author: "Tavi Steinhardt"
+date: "January 25, 2020"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+Housekeeping
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list = ls())  #clean slate
+library(sp)
+library(rgeos)
+library(rJava)
+library(rgdal)
+
+absence.method="kde"
+reps=99 
+randomize=T
+crit=.6
+#nul=F
+
+folder=paste0("C:\\Users\\gusta\\Dropbox\\Data\\LiDAR_paper\\MaxEntResults\\REAL_crit",crit*10,"_abs_",absence.method,Sys.Date())
+exclude=c("SM")
+
+# Set working directory...
+wd_path <- "C:\\Users\\gusta\\Dropbox\\Data\\LiDAR_paper"
+knitr::opts_knit$set(root.dir = wd_path)
+setwd(wd_path)
+#crs.string = CRS("+proj=tmerc +lat_0=-9.5 +lon_0=-70.5 +k=0.99952992 +x_0=1324000 +y_0=1040084.558 +ellps=intl +towgs84=-288,175,-376,0,0,0,0 +units=m +no_defs")
+
+# Make a list of the packages we need, check whether they're installed, and install the ones we're missing...
+required.pkg <- c("raster", "dismo", "RColorBrewer", "rJava", "ENMeval", "sp", "factoextra", "gridExtra", "ggplot2", "cluster","stringr","ape","gdata")
+pkgs.not.installed <- required.pkg[!sapply(required.pkg, function(p) require(p, character.only=T))]
+if (length(pkgs.not.installed) > 0) install.packages(pkgs.not.installed, dependencies=TRUE)
+
+# Load the required libraries...
+lapply(required.pkg, library, character.only = TRUE) 
+
+if(!dir.exists(folder)) dir.create(folder) 
+#folder=folder.num
+#load in geotagged behaviors
+
+behav = read.csv("BehaviorFiles\\MasterBehaviors.csv")
+sleep = read.csv("BehaviorFiles\\STs_for_LiDAR.csv")
+kde=readOGR(dsn="C:\\Users\\gusta\\Dropbox\\Data\\Ranges\\KDE_bound.shp")
+
+act.list=sort(c("Foraging","SleepTree","all","Fruit_Flower","Invertebrate")) #"fsgr" is also an option, but I'm cutting grooming bc I have too few points and they're all in the same places...
+#same goes for exudates and fungi. "f+s" is another option that I'm cutting because it just looks identical to foraging
+sp.list=sort(c("SIMP","LWED"))
+groups.s=c("BA","HS","IC4","MI4","OE","QB","RE")
+groups.l=c("AR","RF","SS","WF","BLOOPS","GP","Sun7")
+
+ 
+colnames(sleep)==colnames(behav)
+behav=rbind(behav,sleep)
+
+#cut out any behaviors that didn't get a geotag (likely because the track file was missing)
+if (length(which(is.na(behav$lat0)))>0) behav=behav[-which(is.na(behav$lat0)),]
+
+if (length(which(behav$group %in% exclude))>0) behav=behav[-which(behav$group %in% exclude),]
+
+```
+
+Separate the different food items
+```{r}
+if ("At trap" %in% behav$FOOD_ITEM) behav=behav[-which(behav$FOOD_ITEM=="At trap"),]
+if ("At Trap" %in% behav$FOOD_ITEM) behav=behav[-which(behav$FOOD_ITEM=="At Trap"),]
+unique(behav$FOOD_ITEM)
+behav$FOOD_ITEM[grep("thropo",behav$FOOD_ITEM)]="Invertebrate"
+behav$FOOD_ITEM[grep("crop",behav$FOOD_ITEM)]="Fruit_Flower"
+behav$FOOD_ITEM[which(behav$FOOD_ITEM %in% c("Fruit","Flower"))]="Fruit_Flower"
+
+
+```
+
+Define rarefy function
+```{r}
+rarefy=function(pts.f){
+cell=c()
+i=1
+
+r=lidar[[1]] #make sure this is a 20m raster...
+#plot(r)
+
+#attach grid 
+for(i in 1:length(pts.f)){
+pt=pts.f[i]
+newcell=cellFromXY(r,pt)
+cell=c(cell,newcell)
+}
+
+#pts.f.loc=cbind(1:length(pts.f),cell)
+keep=c()
+
+for(c in 1:length(unique(cell))){
+  loc = unique(cell)[c]
+  loc
+  #identify points in loc
+  which(cell==loc)
+  #pick a point, doesn't matter which b/c they have the same raster value
+  keep=c(keep,which(cell==loc)[1])
+  keep
+}
+
+length(unique(keep))
+
+
+
+pts.rar=pts.f[unique(keep[which(!is.na(keep))])]
+
+return (pts.rar)
+}
+```
+
+Create raster stack:
+```{r}
+#read in rasters, make sure of the alignments!
+
+
+setwd(wd_path)
+setwd("CICRA_rasters\\6_remasked")
+
+raster.list = list.files()[grep(".tif$",list.files())]
+raster.list
+
+lidar=stack(raster.list[grep("height_",raster.list)])
+remains=raster.list[-grep("height_",raster.list)]
+
+
+r=1
+for (r in 1:length(remains)){
+  newr=raster(remains[r])
+  newr@extent=alignExtent(newr@extent,lidar)
+
+  newr=crop(newr,lidar)
+  lidar=crop(lidar,newr)
+  
+  lidar=stack(lidar,newr)
+    
+}
+
+#lidar = projectRaster(from=lidar,crs="+proj=longlat")
+setwd(wd_path)
+
+plot(lidar[[1]],main=names(lidar)[1])
+names(lidar)
+
+```
+
+Eliminate collinearity in the rasters:
+```{r}
+rpath="C:\\Users\\gusta\\Dropbox\\Data\\LiDAR_paper\\CICRA_rasters\\"
+
+results=layerStats(lidar, stat = "pearson", na.rm=TRUE)$`pearson correlation coefficient`
+diag(results)=0
+max(results)
+high=data.frame(layer=rownames(results),max.corr=rep(NA,nrow(results)))
+
+setwd(rpath)
+results
+results.exp=results
+upperTriangle(results.exp,diag=T)=""
+results.exp
+write.csv(results.exp,file=paste0(folder,"\\RasterCorrelation_full.csv"))
+lidar.raw=lidar
+while (max(results)>crit){
+  
+  high=data.frame(layer=rownames(results),max.corr=rep(NA,nrow(results)))
+  
+for(i in 1:nrow(results)) high[i,2]=max(results[i,])
+
+which(high$max.corr==max(high$max.corr))
+
+lidar=lidar[[-which(high$max.corr==max(results))[1]]]
+length(names(lidar))
+
+results=layerStats(lidar, stat = "pearson", na.rm=TRUE)$`pearson correlation coefficient`
+diag(results)=0
+max(results)
+}
+head(results)
+max(results)
+names(lidar)
+upperTriangle(results,diag=T)=""
+write.csv(results,file=paste0(folder,"\\RasterCorrelation_final.csv"))
+```
+
+define the run.Maxent function
+```{r}
+#act values: Foraging, Grooming, SleepTree, fsgr, all
+#act="Fruit_Flower"
+#sp="SIMP"
+#write=T
+#repno=1
+#reps=3
+#pabs.meth="kde"
+
+#pabs.meth can be: "pts" (absence from behavior points)
+                  #"mcp" (absence from the total MCP of all observations)
+                  #"kde" (absence from the 95%KDE of behavior points)
+
+run.Maxent = function(act,sp,repno=j,pabs.meth,write=T,nul=F) {
+#the hull comes from all behavior points and is used to generate random pseudo-absence points
+  behav$ACTIVITY[which(behav$ACTIVITY=="Being Groomed")]="Grooming" #collapse into an allogroom category
+  behav$FOOD_ITEM[which(behav$FOOD_ITEM %in% c("Fruit","Flower"))]="Fruit_Flower"
+
+if (randomize){
+  behav.raw=behav
+  m=seq(from=-0.00008,to=0.00008,by=0.00001) #degrees to meters (calibrated for the study area)
+  behav$lon0=behav$lon0+sample(m,nrow(behav),replace=T)
+  behav$lat0=behav$lat0+sample(m,nrow(behav),replace=T)
+}
+  
+if (act %in% unique(behav$ACTIVITY)) subset=behav[which(behav$ACTIVITY==act),]
+if (act=="fsgr") subset=behav[which(behav$ACTIVITY %in% c("Foraging","Grooming","SleepTree")),]
+if (act %in% c("fr","fs","f+s")) subset=behav[which(behav$ACTIVITY %in% c("Foraging","SleepTree")),]
+if (act=="all") subset=behav
+if (act %in% c("Fruit_Flower","Exudate","Invertebrate","Fungus")){
+  subset=behav[which(behav$ACTIVITY=="Foraging"),]
+  subset=subset[which(subset$FOOD_ITEM==act),]
+}
+  
+subset=subset[which(subset$species==sp),]
+
+all.pts=data.frame(x=behav$lon0,y=behav$lat0)
+pts.f=data.frame(x=subset$lon0,y=subset$lat0)
+mcp=all.pts[chull(all.pts),]
+
+if(paste0(sp,act)=="LWEDall"){
+  pts.f.backup=pts.f
+  newX=c()
+  newY=c()
+  setwd("C:\\Users\\gusta\\Dropbox\\Data\\Ranges\\Clean_pts_all")
+  grps=groups.l
+  head(pts.f)
+  for (z in c(17:19)){
+    for (p in 1:length(grps)){
+      if (paste0(grps[p],"_clean_",z,".csv") %in% list.files()){      np=read.csv(paste0(grps[p],"_clean_",z,".csv"))
+      newX=c(newX,np$X)
+      newY=c(newY,np$Y)
+      }
+    }
+  }
+  pts.f.backup
+  pts.f=data.frame(x=newX,y=newY)
+  setwd(wd_path)
+}
+
+if(paste0(sp,act)=="SIMPall"){
+  pts.f.backup=pts.f
+  newX=c()
+  newY=c()
+  setwd("C:\\Users\\gusta\\Dropbox\\Data\\Ranges\\Clean_pts_all")
+  grps=groups.s
+  head(pts.f)
+  for (z in c(17:19)){
+    for (p in 1:length(grps)){
+      if (paste0(grps[p],"_clean_",z,".csv") %in% list.files()){      np=read.csv(paste0(grps[p],"_clean_",z,".csv"))
+      newX=c(newX,np$X)
+      newY=c(newY,np$Y)
+      }
+    }
+  }
+  pts.f.backup
+  pts.f=data.frame(x=newX,y=newY)
+  setwd(wd_path)
+}
+
+
+all.pts=SpatialPoints(all.pts,proj4string=CRS("+proj=longlat"))
+pts.f=SpatialPoints(pts.f,proj4string=CRS("+proj=longlat"))
+mcp=SpatialPoints(mcp,proj4string=CRS("+proj=longlat"))
+#pts.gr=all.pts[which(behav$ACTIVITY=="Grooming"),]
+#pts.f=pts.f[,2:1]
+#pts.f=behav[which(behav$ACTIVITY=="Foraging"),(12:11)]
+#absence=behav[which(behav$ACTIVITY!="Foraging"),(12:11)]
+all.pts=spTransform(all.pts,lidar@crs)
+pts.f=spTransform(pts.f,lidar@crs)
+mcp=spTransform(mcp,lidar@crs)
+
+hull = Polygon(mcp)
+hull.list <- Polygons(list(hull), ID="hull")
+mcp = SpatialPolygons(list(hull.list))
+
+plot(all.pts,pch=".", main=paste0(sp," ",act," ",100*round(repno/reps,2),"%"))
+#lines(mcp)
+lines(kde)
+points(pts.f,pch=18)
+
+
+#draw pseudo-absence points
+if (pabs.meth=="mcp") pabs <- spsample(mcp, 500, type="random")
+if (pabs.meth=="kde") pabs = spsample(kde,500, type="random")
+if (pabs.meth=="pts") pabs = all.pts[sample(1:length(all.pts),500)]
+   
+
+
+points(pabs,pch=".",col=2)
+
+
+#rarefy points down to only 1 per raster cell
+
+#pts.rar.gr=rarefy(pts.gr)
+
+#calculate prevalence
+#cellFromPolygon(r,mcp)
+pts.rar.f=rarefy(pts.f)
+#facs=names(lidar)[grep("within",names(lidar))]
+
+if (nul==F){
+
+#4fold testing
+k=5
+ fold <- kfold(pts.rar.f, k=k)
+  occtest <- pts.rar.f[fold == 1, ]
+  occtrain <- pts.rar.f[fold != 1, ]
+  
+  facs=c(names(lidar)[grep("within",names(lidar))],names(lidar)[grep("ForestType",names(lidar))])
+  bdm.f = maxent(lidar,occtrain,a=pabs,factors=facs)
+#e1 = evaluate(bdm.f, p=occtest, a=pabs, x=lidar)
+  
+e <- list()
+for (i in 1:k) {
+train <- pts.rar.f[fold != i,]
+test <- pts.rar.f[fold == i,]
+bc <- lidar
+e[[i]] <- evaluate(p=test, a=pabs, model=bdm.f,x=lidar)
+}
+  
+#plot(lidar[[1]])
+#points(pts.rar.f)
+#if (write==T) {
+if (!dir.exists(paste0(folder,"\\",sp,act))) dir.create(paste0(folder,"\\",sp,act))
+pr=predict(bdm.f,lidar)
+writeRaster(pr,file=paste0(folder,"\\",sp,act,"\\",repno,".tif"))
+save(bdm.f,file=paste0(folder,"\\",sp,act,"\\",repno,".RData"))
+save(e,file=paste0(folder,"\\",sp,act,"\\",repno,"eval.RData"))
+
+}
+
+if (nul==T){
+ 
+  #get number of pts.rar.f
+  #take that number from pabs OR create that many random points and save as pts.f
+  n=length(pts.rar.f)
+
+  if (n>=length(pabs)){
+  if (pabs.meth=="mcp") pts.null = spsample(mcp, n, type="random")
+if (pabs.meth=="kde") pts.null = spsample(kde, n, type="random")
+if (pabs.meth=="pts") pts.null = all.pts[sample(1:length(all.pts),n)]
+  }
+  
+  if (n<length(pabs)) pts.null=pabs[sample(1:length(pabs),n)]
+
+    k=5
+ fold <- kfold(pts.null, k=k)
+  occtest <- pts.null[fold == 1, ]
+  occtrain <- pts.null[fold != 1, ]
+  
+  facs=c(names(lidar)[grep("within",names(lidar))],names(lidar)[grep("ForestType",names(lidar))])
+  bdm.f = maxent(lidar,occtrain,a=pabs,factors=facs)
+#e1 = evaluate(bdm.f, p=occtest, a=pabs, x=lidar)
+
+aucs=rep(NA,k)
+e <- list()
+for (i in 1:k) {
+train <- pts.null[fold != i,]
+test <- pts.null[fold == i,]
+bc <- lidar
+e[[i]] <- evaluate(p=test, a=pabs, model=bdm.f,x=lidar)
+aucs[i] = e[[i]]@auc
+}
+   
+return(median(aucs))
+
+}
+#return(bdm.f)
+}
+#}
+
+
+#prev=bdm.f@results[which(rownames(bdm.f@results)=="Prevalence..average.probability.of.presence.over.background.sites.")]
+
+
+#prev
+#auc
+
+#plot(bdm.map.f)
+
+#vec=c("a","hurm")
+#str_c(vec,collapse="")
+
+#bdm.f
+
+#bdm.html= str_c(readLines(bdm.f@html),collapse="<br>")
+#html.path=gsub("/","\\\\",bdm.f@html)
+#save_html(bdm.html,file="LOLjk.html")
+#file.copy(from=html.path,to=paste0(wd_path,"\\LOLjk2.html"))
+
+
+```
+
+set up a null AUC data frame
+```{r}
+mls=expand.grid(sp.list,act.list)
+mls=sort(paste0(mls[,1],mls[,2]))
+
+auc.n=data.frame(matrix(nrow=reps,ncol=length(mls)))
+colnames(auc.n)=mls
+head(auc.n)
+```
+
+run the thing! 100 reps takes 2 days, including analysis time
+```{r}
+start=1
+#checkfolder=paste0(folder,"\\LWEDall\\")
+#finreps=list.files(checkfolder)[grep(".RData",list.files(checkfolder))]
+#if(length(finreps)>0) start=as.numeric(length(finreps))+1
+#if (reps>start){
+j=1
+s=1
+a=1
+for(j in start:reps){
+for (s in 1:length(sp.list)){
+  sp=sp.list[s]
+for(a in 1:length(act.list)){
+  act=act.list[a]
+
+run.Maxent(act,sp,pabs.meth=absence.method)
+
+nullmod=run.Maxent(act,sp,pabs.meth=absence.method,nul=T)
+
+auc.n[j,which(colnames(auc.n)==paste0(sp,act))]=nullmod
+head(auc.n)
+}
+}
+}
+
+write.csv(auc.n,file=paste0(folder,"\\AUC_null.csv"))
+#}
+```
+
+
+Click here to do it all at once:
+```{r}
+
+```
+
+
+
+########## RESULTS #########
+
+AUC and variable contribution results:
+```{r}
+#f.l
+list.files(folder)
+if (length(grep("csv",list.files(folder)))>0) mdls=list.files(folder)[-grep("csv",list.files(folder))]
+if (length(grep("csv",mdls))>0) mdls=mdls[-grep(".xlsx",mdls)]
+if (length(grep("meanRas",mdls))>0) mdls=mdls[-grep("meanRas",mdls)]
+
+mdls
+
+load(paste0(folder,"\\",mdls[1],"\\",1,".RData"))
+var.list=gsub("\\.\\w+$","",rownames(bdm.f@results)[grep(".contribution",rownames(bdm.f@results))])
+
+#reps=length(list.files(paste0(folder,"\\",mdls[1]))[grep(".RData",list.files(paste0(folder,"\\",mdls[1])))])
+
+lidar.list=names(lidar[[c(1:nlayers(lidar))]])
+results.corr=array(dim=c(length(mdls),length(lidar.list),reps))
+colnames(results.corr)=lidar.list
+rownames(results.corr)=mdls
+results.corr.m=results.corr[,,1]
+results.corr.sd=results.corr.m
+
+auc.m=rep(NA,length(mdls))
+names(auc.m)=mdls
+auc.sd=auc.m
+
+results.con=array(dim=c(length(mdls),length(var.list),reps))
+rownames(results.con)=mdls
+colnames(results.con)=var.list
+results.con
+
+results.per=results.con
+
+results.con.m=results.con[,,1]
+results.con.sd=results.con.m
+results.per.m=results.con.m
+results.per.sd=results.con.m
+
+results.per.sd
+
+#r=1
+#f=1
+#v=1
+
+for (r in 1:length(mdls)){ #r is a model type
+  subfolder=paste0(folder,"\\",mdls[r])
+  new.aucs=c()
+  for (f in 1:reps){ #f is a replication file number
+    load(paste0(subfolder,"\\",f,".RData"))
+    load(paste0(subfolder,"\\",f,"eval.RData"))
+    vals=c()
+    for (i in 1:length(e)) vals=c(vals,e[[i]]@auc)
+    new.aucs=c(new.aucs,median(vals))
+    for(v in 1:length(var.list)){
+      var=var.list[v]
+    results.con[r,v,f]=bdm.f@results[grep(paste0(var,".contribution"),rownames(bdm.f@results)),]
+    results.per[r,v,f]=bdm.f@results[grep(paste0(var,".permutation"),rownames(bdm.f@results)),]
+    }
+    for (l in 1:length(lidar.list)){
+      pred=raster(paste0(subfolder,"\\",f,".tif"))
+      plot(pred,main=paste0(mdls[r]," ",round(((f/reps)*100),1),"%"))
+      corr=layerStats(stack(pred,lidar[[l]]), stat = "pearson", na.rm=TRUE)$`pearson correlation coefficient`[1,2]
+    results.corr[r,l,f]=corr  
+      
+    }
+  }
+  new.aucs
+  auc.m[r]=mean(new.aucs)
+  auc.sd[r]=sd(new.aucs)
+  
+}
+
+for (c in 1:ncol(results.con)){
+  for (r in 1:nrow(results.con)){
+    results.con.m[r,c]=mean(results.con[r,c,])
+    results.con.sd[r,c]=sd(results.con[r,c,])
+    results.per.m[r,c]=mean(results.per[r,c,])
+    results.per.sd[r,c]=mean(results.per[r,c,])
+  }
+}
+
+for(c in 1:ncol(results.corr)){
+  for (r in 1: nrow(results.corr)){
+    results.corr.m[r,c]=mean(results.corr[r,c,])
+    results.corr.sd[r,c]=sd(results.corr[r,c,])
+  }
+ }
+
+results.per.sd
+
+results.per[2,4,]
+
+auc.sd
+auc.m
+
+#mperf$auc_mean=auc.m
+#mperf$auc_sd=auc.sd
+
+auc.csv=data.frame(AUC_mean=auc.m,AUC_sd=auc.sd)
+mperf=read.csv("C:\\Users\\gusta\\Dropbox\\Data\\LiDAR_paper\\modelPerformance.csv")
+for(r in 1:nrow(auc.csv)){
+  name=rownames(auc.csv)[r]
+  row=which(mperf$X==name)
+  mperf$auc_mean[row]=auc.csv$AUC_mean[r]
+  mperf$auc_sd[row]=auc.csv$AUC_sd[r]
+  
+}
+
+mperf
+
+#mdls==mperf[,1] #if one or more of these is FALSE, you have a problem
+
+#write results (full path)
+write.csv(mperf,file=paste0(folder,"\\AUC.csv"))
+write.csv(results.con.m, file=paste0(folder,"\\VarConMean.csv"))
+write.csv(results.con.sd, file=paste0(folder,"\\VarConSD.csv"))
+write.csv(results.per.m, file=paste0(folder,"\\VarPermMean.csv"))
+write.csv(results.per.sd, file=paste0(folder, "\\VarPerSD.csv"))
+write.csv(results.corr.m, file=paste0(folder, "\\VarCorrMean.csv"))
+write.csv(results.corr.sd, file=paste0(folder, "\\VarCorrSD.csv"))
+
+```
+
+p-score:
+```{r}
+head(mperf)
+head(auc.n)
+auc.p=rep(NA,ncol(auc.n))
+names(auc.p)=colnames(auc.n)
+auc.p
+n=1
+for(n in 1:ncol(auc.n)){
+  test=mperf$auc_mean[which(mperf$X==colnames(auc.n)[n])]
+  auc.p[n]=length(which(auc.n[,n]>test))/100
+  
+  
+}
+
+auc.p
+
+```
+
+
+Average the rasters for each model:
+```{r}
+setwd(folder)
+if(!dir.exists("meanRasters")) dir.create("meanRasters")
+
+
+for (s in 1:length(sp.list)){
+  for (a in 1:length(act.list)){
+    sp=sp.list[s]
+    act=act.list[a]
+    if (paste0(sp,act) != "SIMPExudate"){
+
+setwd(paste0(folder,"\\",sp,act))
+pr.list=list.files(paste0(folder,"\\",sp,act))
+pr.list=pr.list[grep("tif$",pr.list)]
+pr=stack(pr.list)
+mn=calc(pr,fun=mean)
+#s=calc(pr,fun=sd)
+plot(mn,main=paste(sp,act))
+writeRaster(mn,filename = paste0(folder,"\\meanRasters\\",sp,act,"_mean.tif"))
+pr.list
+
+setwd(wd_path)
+
+    }
+  }
+}
+```
+
+
+
+Niche overlap results:
+```{r}
+files=list.files(folder)[-grep("\\.",list.files(folder))]
+if (length(grep("meanRasters",files))>0) files=files[-grep("meanRasters",files)]
+files
+results=data.frame(matrix(nrow=length(files),ncol=length(files)))
+colnames(results)=files
+rownames(results)=files
+results.m=results
+results.sd=results
+results.p=results
+results.t=results
+results.df=results
+results.m
+r=4
+f=1
+for (r in 1:nrow(results)){ #r is a row
+  for (c in 1:ncol(results)){
+    if (r!=c){
+  fol1=paste0(folder,"\\",colnames(results)[c])
+  fol1
+  fol2=paste0(folder,"\\",rownames(results)[r])
+  fol2
+  reps=length(list.files(fol1)[grep("\\.tif",list.files(fol1))])
+  ord=sample(c(1:reps),reps)
+  schD=c()
+  for (f in 1:reps){ #f is a file number. 
+  load(paste0(fol1,"\\",f,".RData"))
+  a=raster(paste0(fol1,"\\",f,".tif"))
+  load(paste0(fol2,"\\",ord[f],".RData"))
+  b=raster(paste0(fol2,"\\",ord[f],".tif"))
+  nicheOverlap(a,b,stat="D")
+  schD=c(schD,nicheOverlap(a,b,stat="D"))
+  rval=r*ncol(results)+c
+  totval=ncol(results)**2+nrow(results)
+  plot(x=rep(1,reps),y=1:reps,pch=".",main=paste0("nicheOverlap ",round((rval/totval)*100,2),"%"))
+  points(x=1,y=f,pch=2)
+  }
+  
+  schD
+  results.m[r,c]=mean(schD)
+  results.sd[r,c]=sd(schD)
+  
+  #null hypothesis: we take both maps from folder 1 (the COLUMN)
+  
+  schD.null=c()
+  for (f in 1:reps){ #f is a file number. 
+  load(paste0(fol1,"\\",f,".RData"))
+  a=raster(paste0(fol1,"\\",f,".tif"))
+  load(paste0(fol1,"\\",ord[f],".RData"))
+  b=raster(paste0(fol1,"\\",ord[f],".tif"))
+
+  schD.null=c(schD.null,nicheOverlap(a,b,stat="D"))
+  schD.null
+  #plot(x=rep(1,reps),y=1:reps,pch=".",main=paste0("null ",round((r/nrow(results))*100,2),"%"))
+  points(x=1,y=f,pch=17)
+  }
+  t=t.test(schD,schD.null)
+  results.p[r,c]=t$p.value
+  results.t[r,c]=t$statistic
+  results.df[r,c]=t$parameter
+  }
+  }
+}
+results.m
+
+#write results (full path):
+#ovrlp=cbind(colnames(results.m),rownames(results.m),diag(as.matrix(results.m))     ,diag(as.matrix(results.sd)),diag(as.matrix(results.p)),diag(as.matrix(results.t)),diag(as.matrix(results.df)))
+#colnames(ovrlp)=c("X","Y","schD_mean","schD_sd","ttest_p","ttest_t","ttest_df")
+write.csv(results.m,file=paste0(folder,"\\nicheOverlap_mean.csv"))
+write.csv(results.sd,file=paste0(folder,"\\nicheOverlap_SD.csv"))
+write.csv(results.p,file=paste0(folder,"\\nicheOverlap_p.csv"))
+write.csv(results.t,file=paste0(folder,"\\nicheOverlap_t.csv"))
+write.csv(results.df,file=paste0(folder,"\\nicheOverlap_df.csv"))
+```
+
+
+
+Click here to do it all at once:
+```{r}
+
+```
+
